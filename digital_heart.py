@@ -101,7 +101,16 @@ def euler_step(
         dw/dt = ε·(v + β - γ·w)
     """
     lap = laplacian(v, params.dx)
-    dv = v - (v ** 3) / 3.0 - w + params.D * lap
+
+    # 【修改】为坏死区构建空间扩散系数场：坏死区内 D=0，彻底阻止电流扩散穿透
+    if params.dead_zones:
+        D_field = np.full_like(v, params.D)
+        for zone in params.dead_zones:
+            D_field[zone] = 0.0
+        dv = v - (v ** 3) / 3.0 - w + D_field * lap
+    else:
+        dv = v - (v ** 3) / 3.0 - w + params.D * lap
+
     if I_stim is not None:
         dv += I_stim
     dw = params.epsilon * (v + params.beta - params.gamma * w)
@@ -109,7 +118,7 @@ def euler_step(
     v_new = v + params.dt * dv
     w_new = w + params.dt * dw
 
-    # Enforce dead (necrotic) zones: clamp both variables to zero
+    # 【修改】坏死区严格归零：每一个 Euler step 结束后强制 v=w=0
     for zone in params.dead_zones:
         v_new[zone] = 0.0
         w_new[zone] = 0.0
@@ -160,8 +169,9 @@ def make_animation(
     title: str = "FitzHugh-Nagumo  —  Membrane Potential  v",
     cmap: str = "magma",
     fps: int = 30,
-    vmin: float = -2.5,
-    vmax: float = 2.5,
+    # 【修改】将色彩值域从 ±2.5 收紧到 ±2.0，匹配 FHN 实际 v 范围，提高对比度
+    vmin: float = -2.0,
+    vmax: float = 2.0,
     dpi: int = 120,
 ):
     """Render *frames* into an .mp4 or .gif and save to *filename*."""
@@ -226,8 +236,9 @@ def scenario_arrhythmia_spiral() -> Tuple[FHNParams, dict]:
     arrhythmias.  Strategy: S1-S2 cross-field stimulation protocol.
 
     1.  S1 — stimulate the left edge (plane wave travelling rightward).
-    2.  S2 — after the wave has passed halfway, stimulate the bottom-left
-         quadrant.  The broken wavefront curls into a spiral.
+    2.  S2 — when the S1 wavefront crosses the grid midline, stimulate the
+         bottom-left quadrant to create a broken wavefront that curls into
+         a spiral.
     """
     params = FHNParams(
         N=100, D=1.0, epsilon=0.08, beta=0.7, gamma=0.8,
@@ -236,12 +247,31 @@ def scenario_arrhythmia_spiral() -> Tuple[FHNParams, dict]:
         stim_value=1.5,
     )
 
+    # 【修改】使用自适应 S2 触发，取代原先硬编码的 step==600
+    _s2_fired = [False]
+
     def s2_stim(step, v, w):
-        """Deliver a cross-field S2 stimulus at the right moment."""
-        if step == 600:
-            I = np.zeros_like(v)
-            I[50:, :50] = 1.5
-            return I
+        """
+        自适应 S2：实时监测 S1 波前位置，当波前（v > 0.5）刚跨过
+        网格中线时，在左下象限直接将 v 重置为 1.5（强刺激）。
+
+        此时该区域左侧已从 S1 激发中恢复（w 低 → 可再次激发），
+        右侧仍处于相对不应期（w 高 → 无法激发），从而形成
+        单向传导阻滞，断裂的波前端部自卷曲产生螺旋波。
+        """
+        if _s2_fired[0]:
+            return None
+
+        N = params.N
+        mid = N // 2
+
+        # 检测 S1 波前是否已到达中线列
+        if np.any(v[:, mid] > 0.5):
+            _s2_fired[0] = True
+            # 【关键】直接设置 v 而非叠加微弱的 I_stim
+            # 原 I_stim=1.5 单步仅贡献 dt*1.5=0.15，不足以在不应期组织中触发兴奋
+            v[mid:, :mid] = 1.5
+
         return None
 
     return params, dict(
@@ -260,9 +290,11 @@ def scenario_arrhythmia_block() -> Tuple[FHNParams, dict]:
     dead = [
         (slice(30, 70), slice(45, 55)),   # vertical scar band
     ]
+    # 【修改】D 从 0.6 降至 0.5，减缓传导速度使绕行路径更明显；
+    # n_steps 从 4000 增至 5000，留出更多时间观察衍射尾迹
     params = FHNParams(
-        N=100, D=0.6, epsilon=0.08, beta=0.7, gamma=0.8,
-        dt=0.1, dx=1.0, n_steps=4000,
+        N=100, D=0.5, epsilon=0.08, beta=0.7, gamma=0.8,
+        dt=0.1, dx=1.0, n_steps=5000,
         stim_region=(slice(0, 5), slice(0, 100)),   # top-edge plane wave
         stim_value=1.5,
         dead_zones=dead,
